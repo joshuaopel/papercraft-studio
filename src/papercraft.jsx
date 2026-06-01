@@ -47,6 +47,14 @@ const PART_PRESETS = {
   hat:       { kind: 'accessory', label: 'Hat/Crown', size: [30, 18, 0], icon: Crown },
 };
 
+// Print page sizes in mm. Margin is the unprintable border most home printers reserve.
+const PAGE_SIZES = {
+  letter: { label: 'Letter (8.5 × 11")', w: 215.9, h: 279.4 },
+  a4:     { label: 'A4 (210 × 297mm)',   w: 210,   h: 297   },
+};
+const PRINT_MARGIN_MM = 6;
+const PART_GAP_MM = 4;
+
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -150,6 +158,62 @@ function layoutParts(parts, scale, padding = 50) {
     totalWidth: maxW + padding * 2,
     totalHeight: cursorY,
   };
+}
+
+// Shelf-pack parts onto pages of a given size. Each part stays whole on one page.
+// Coordinates are in the same units as `scale` (px when scale = mm-to-px).
+// Returns { pages: [{ layouts: [{part,x,y,width,height,tab}] }], pageW, pageH, margin, error }.
+function paginateParts(parts, scale, pageId = 'letter') {
+  const page = PAGE_SIZES[pageId] || PAGE_SIZES.letter;
+  const pageW = page.w * scale;
+  const pageH = page.h * scale;
+  const margin = PRINT_MARGIN_MM * scale;
+  const gap = PART_GAP_MM * scale;
+  const printW = pageW - margin * 2;
+  const printH = pageH - margin * 2;
+
+  const oversized = [];
+  parts.forEach((part) => {
+    const m = partMetrics(part, scale);
+    if (m.width > printW + 0.5 || m.height > printH + 0.5) {
+      oversized.push({ part, m });
+    }
+  });
+  if (oversized.length) {
+    const names = oversized.map((o) => o.part.label).join(', ');
+    return {
+      pages: [],
+      pageW, pageH, margin,
+      error: `Won't fit on a ${page.label} page: ${names}. Shrink the part(s) or switch page size.`,
+    };
+  }
+
+  const pages = [];
+  let cur = { layouts: [], shelfY: margin, shelfX: margin, shelfH: 0 };
+  const newPage = () => {
+    if (cur.layouts.length) pages.push(cur);
+    cur = { layouts: [], shelfY: margin, shelfX: margin, shelfH: 0 };
+  };
+
+  parts.forEach((part) => {
+    const m = partMetrics(part, scale);
+    // Wrap to new shelf if width doesn't fit
+    if (cur.shelfX + m.width > pageW - margin + 0.5) {
+      cur.shelfY += cur.shelfH + gap;
+      cur.shelfX = margin;
+      cur.shelfH = 0;
+    }
+    // Wrap to new page if shelf doesn't fit vertically
+    if (cur.shelfY + m.height > pageH - margin + 0.5) {
+      newPage();
+    }
+    cur.layouts.push({ part, x: cur.shelfX, y: cur.shelfY, ...m });
+    cur.shelfX += m.width + gap;
+    cur.shelfH = Math.max(cur.shelfH, m.height);
+  });
+  if (cur.layouts.length) pages.push(cur);
+
+  return { pages, pageW, pageH, margin, error: null };
 }
 
 // ============================================================================
@@ -796,6 +860,8 @@ export default function PapercraftStudio() {
   const [selectedUid, setSelectedUid] = useState(() => parts[0]?.uid);
   const [selectedFace, setSelectedFace] = useState('F');
   const [showLabels, setShowLabels] = useState(true);
+  const [pageSize, setPageSize] = useState('letter');
+  const [exportError, setExportError] = useState(null);
 
   // OpenAI — prefill from VITE_OPENAI_API_KEY in .env.local if present; user can override in the UI.
   const [openaiKey, setOpenaiKey] = useState(() => import.meta.env.VITE_OPENAI_API_KEY || '');
@@ -924,44 +990,95 @@ export default function PapercraftStudio() {
   };
 
   // --- Render canvas ---
+  // Preview mirrors the paginated print layout: each page rendered stacked
+  // vertically with a dashed page boundary and the printable margin shown.
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
-    const scale = 2.5;
-    const { layouts, totalWidth, totalHeight } = layoutParts(parts, scale);
+    const scale = 2.5; // px per mm for preview
+    const result = paginateParts(parts, scale, pageSize);
+    const { pages, pageW, pageH, margin } = result;
 
-    canvas.width = Math.max(600, totalWidth);
-    canvas.height = Math.max(400, totalHeight);
+    const gutter = 24;
+    const safePages = pages.length || 1;
+    canvas.width = Math.max(600, Math.ceil(pageW + gutter * 2));
+    canvas.height = Math.max(400, Math.ceil(safePages * pageH + (safePages + 1) * gutter));
 
-    // Paper background
-    ctx.fillStyle = '#fbf6ea';
+    // Workspace background (around the pages)
+    ctx.fillStyle = '#ece1c4';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Grain
-    ctx.fillStyle = 'rgba(120, 90, 50, 0.04)';
-    for (let i = 0; i < (canvas.width * canvas.height) / 800; i++) {
-      ctx.fillRect(Math.random() * canvas.width, Math.random() * canvas.height, 1, 1);
-    }
+    pages.forEach((p, pi) => {
+      const pageX = gutter;
+      const pageY = gutter + pi * (pageH + gutter);
 
-    layouts.forEach(({ part, x, y }) => {
-      drawPart(ctx, part, x, y, scale, { showLabels });
+      // Paper
+      ctx.fillStyle = '#fbf6ea';
+      ctx.fillRect(pageX, pageY, pageW, pageH);
+
+      // Grain
+      ctx.fillStyle = 'rgba(120, 90, 50, 0.04)';
+      const grainCount = Math.floor((pageW * pageH) / 800);
+      for (let i = 0; i < grainCount; i++) {
+        ctx.fillRect(pageX + Math.random() * pageW, pageY + Math.random() * pageH, 1, 1);
+      }
+
+      // Page border + printable margin
+      ctx.strokeStyle = 'rgba(80, 60, 30, 0.4)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(pageX + 0.5, pageY + 0.5, pageW - 1, pageH - 1);
+      ctx.strokeStyle = 'rgba(168, 66, 26, 0.25)';
+      ctx.setLineDash([4, 4]);
+      ctx.strokeRect(pageX + margin, pageY + margin, pageW - margin * 2, pageH - margin * 2);
+      ctx.setLineDash([]);
+
+      // Page label
+      ctx.fillStyle = '#6b4f2a';
+      ctx.font = 'italic 12px Georgia';
+      ctx.textAlign = 'left';
+      ctx.fillText(`Page ${pi + 1} of ${pages.length}`, pageX + 6, pageY - 6);
+
+      // Parts on this page (their x/y are already page-local from margin)
+      p.layouts.forEach(({ part, x, y }) => {
+        drawPart(ctx, part, pageX + x, pageY + y, scale, { showLabels });
+      });
+
+      // Highlight selected part
+      if (selectedPart) {
+        const sel = p.layouts.find((l) => l.part.uid === selectedPart.uid);
+        if (sel) {
+          ctx.strokeStyle = 'rgba(168, 66, 26, 0.6)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([8, 5]);
+          ctx.strokeRect(pageX + sel.x - 4, pageY + sel.y - 4, sel.width + 8, sel.height + 8);
+          ctx.setLineDash([]);
+        }
+      }
     });
 
-    // Highlight selected part bbox
-    if (selectedPart) {
-      const sel = layouts.find((l) => l.part.uid === selectedPart.uid);
-      if (sel) {
-        ctx.strokeStyle = 'rgba(168, 66, 26, 0.55)';
-        ctx.lineWidth = 2;
-        ctx.setLineDash([8, 5]);
-        ctx.strokeRect(sel.x - 4, sel.y - 4, sel.width + 8, sel.height + 8);
-        ctx.setLineDash([]);
-      }
+    // If pagination errored, draw a single empty page with a warning
+    if (result.error) {
+      const pageX = gutter, pageY = gutter;
+      ctx.fillStyle = '#fbf6ea';
+      ctx.fillRect(pageX, pageY, pageW, pageH);
+      ctx.strokeStyle = 'rgba(168, 66, 26, 0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(pageX + 0.5, pageY + 0.5, pageW - 1, pageH - 1);
+      ctx.fillStyle = '#a8421a';
+      ctx.font = 'italic 14px Georgia';
+      ctx.textAlign = 'center';
+      ctx.fillText('Some parts do not fit this page size.', pageX + pageW / 2, pageY + pageH / 2);
     }
-  }, [parts, showLabels, selectedPart]);
+  }, [parts, showLabels, selectedPart, pageSize]);
 
   useEffect(() => { renderCanvas(); }, [renderCanvas]);
+
+  // Reflect pagination errors in the header banner whenever parts/page change
+  useEffect(() => {
+    const r = paginateParts(parts, 1, pageSize);
+    setExportError(r.error);
+  }, [parts, pageSize]);
 
   useEffect(() => {
     const host = previewRef.current;
@@ -1038,32 +1155,56 @@ export default function PapercraftStudio() {
     };
   }, [parts]);
 
-  // --- Export PNG @ 300 DPI ---
-  const exportPNG = () => {
-    const scale = mm(1, 300);
-    const { layouts, totalWidth, totalHeight } = layoutParts(parts, scale, 100);
+  // Trigger a browser download for a blob
+  const downloadBlob = (blob, filename) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
 
-    const out = document.createElement('canvas');
-    out.width = totalWidth;
-    out.height = totalHeight;
-    const ctx = out.getContext('2d');
+  // Build a canvas containing one full page at the export scale.
+  // Background white, parts drawn at their per-page (x, y).
+  const renderPageCanvas = (pageLayout, pageW, pageH, scale, opts = {}) => {
+    const c = document.createElement('canvas');
+    c.width = Math.ceil(pageW);
+    c.height = Math.ceil(pageH);
+    const ctx = c.getContext('2d');
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, out.width, out.height);
-
-    layouts.forEach(({ part, x, y }) => {
-      drawPart(ctx, part, x, y, scale, { showLabels: false });
+    ctx.fillRect(0, 0, c.width, c.height);
+    pageLayout.layouts.forEach(({ part, x, y }) => {
+      drawPart(ctx, part, x, y, scale, { showLabels: false, ...opts });
     });
+    return c;
+  };
 
-    out.toBlob((blob) => {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `papercraft-${Date.now()}.png`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }, 'image/png');
+  // --- Export PNG @ 300 DPI ---
+  // Single page → single PNG. Multi-page → zip of page-NN.png.
+  const exportPNG = async () => {
+    const scale = mm(1, 300);
+    const { pages, pageW, pageH, error } = paginateParts(parts, scale, pageSize);
+    if (error) { setExportError(error); return; }
+    setExportError(null);
+
+    if (pages.length === 1) {
+      const c = renderPageCanvas(pages[0], pageW, pageH, scale);
+      const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+      downloadBlob(blob, `papercraft-${pageSize}-${Date.now()}.png`);
+      return;
+    }
+
+    const zip = new JSZip();
+    for (let i = 0; i < pages.length; i++) {
+      const c = renderPageCanvas(pages[i], pageW, pageH, scale);
+      const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+      zip.file(`page-${String(i + 1).padStart(2, '0')}.png`, blob);
+    }
+    const blob = await zip.generateAsync({ type: 'blob' });
+    downloadBlob(blob, `papercraft-${pageSize}-pages-${Date.now()}.zip`);
   };
 
   // Render a single layer to an offscreen canvas sized to its bbox.
@@ -1075,98 +1216,106 @@ export default function PapercraftStudio() {
     return c;
   };
 
-  // --- Export layered PSD @ 300 DPI ---
-  // One group per part. Inside each group: a layer per face (F/B/L/R/T/D),
-  // plus a combined Tabs layer and a Fold lines layer.
-  const exportPSD = () => {
-    const scale = mm(1, 300);
-    const { layouts, totalWidth, totalHeight } = layoutParts(parts, scale, 100);
-    const W = Math.ceil(totalWidth);
-    const H = Math.ceil(totalHeight);
-
+  // Build a layered PSD ArrayBuffer for one page.
+  // One group per part on the page; faces, Tabs, Fold lines as sub-layers.
+  const buildPagePsd = (pageLayout, pageW, pageH) => {
+    const W = Math.ceil(pageW);
+    const H = Math.ceil(pageH);
     const bg = document.createElement('canvas');
     bg.width = W; bg.height = H;
     const bgCtx = bg.getContext('2d');
     bgCtx.fillStyle = '#ffffff';
     bgCtx.fillRect(0, 0, W, H);
-
     const children = [{ name: 'Paper', canvas: bg, top: 0, left: 0 }];
-
-    layouts.forEach(({ part, x, y }) => {
-      const { groupName, layers } = buildPartLayers(part, x, y, scale);
-      const groupChildren = layers.map((l) => {
-        const canvas = renderLayerCanvas(l);
-        return {
-          name: l.name,
-          canvas,
-          top: Math.floor(l.y),
-          left: Math.floor(l.x),
-        };
-      });
+    pageLayout.layouts.forEach(({ part, x, y }) => {
+      const { groupName, layers } = buildPartLayers(part, x, y, mm(1, 300));
+      const groupChildren = layers.map((l) => ({
+        name: l.name,
+        canvas: renderLayerCanvas(l),
+        top: Math.floor(l.y),
+        left: Math.floor(l.x),
+      }));
       children.push({ name: groupName, opened: true, children: groupChildren });
     });
+    return writePsd({ width: W, height: H, children });
+  };
 
-    const psd = { width: W, height: H, children };
-    const buffer = writePsd(psd);
-    const blob = new Blob([buffer], { type: 'application/octet-stream' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `papercraft-${Date.now()}.psd`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  // --- Export layered PSD @ 300 DPI ---
+  // Single page → single .psd. Multi-page → zip of page-NN.psd.
+  const exportPSD = async () => {
+    const scale = mm(1, 300);
+    const { pages, pageW, pageH, error } = paginateParts(parts, scale, pageSize);
+    if (error) { setExportError(error); return; }
+    setExportError(null);
+
+    if (pages.length === 1) {
+      const buffer = buildPagePsd(pages[0], pageW, pageH);
+      downloadBlob(new Blob([buffer], { type: 'application/octet-stream' }),
+        `papercraft-${pageSize}-${Date.now()}.psd`);
+      return;
+    }
+
+    const zip = new JSZip();
+    for (let i = 0; i < pages.length; i++) {
+      const buffer = buildPagePsd(pages[i], pageW, pageH);
+      zip.file(`page-${String(i + 1).padStart(2, '0')}.psd`, buffer);
+    }
+    const blob = await zip.generateAsync({ type: 'blob' });
+    downloadBlob(blob, `papercraft-${pageSize}-psd-pages-${Date.now()}.zip`);
   };
 
   // --- Export layered PNG set as ZIP @ 300 DPI ---
-  // Per-part subfolder of transparent PNGs (one per face + tabs + fold lines)
-  // plus a manifest.json with sheet dimensions and per-layer (x, y, w, h).
+  // Top-level page-NN/ dirs, each containing per-part subfolders of transparent
+  // PNGs (face panels + tabs + fold lines). manifest.json describes pages,
+  // page dimensions in pixels, and every layer's (x, y, w, h) on its page.
   const exportLayerZip = async () => {
     const scale = mm(1, 300);
-    const { layouts, totalWidth, totalHeight } = layoutParts(parts, scale, 100);
-    const W = Math.ceil(totalWidth);
-    const H = Math.ceil(totalHeight);
+    const { pages, pageW, pageH, error } = paginateParts(parts, scale, pageSize);
+    if (error) { setExportError(error); return; }
+    setExportError(null);
 
     const zip = new JSZip();
+    const W = Math.ceil(pageW);
+    const H = Math.ceil(pageH);
     const manifest = {
-      sheet: { width: W, height: H, dpi: 300, units: 'pixels' },
-      parts: [],
+      page: { size: pageSize, width: W, height: H, dpi: 300, units: 'pixels' },
+      pageCount: pages.length,
+      pages: [],
     };
 
-    for (const { part, x, y } of layouts) {
-      const { groupName, layers } = buildPartLayers(part, x, y, scale);
-      const folderName = safeName(groupName);
-      const folder = zip.folder(folderName);
-      const partEntry = { name: groupName, folder: folderName, layers: [] };
-      for (let i = 0; i < layers.length; i++) {
-        const l = layers[i];
-        const canvas = renderLayerCanvas(l);
-        const blob = await new Promise((res) => canvas.toBlob(res, 'image/png'));
-        const fileName = `${String(i + 1).padStart(2, '0')}-${safeName(l.name)}.png`;
-        folder.file(fileName, blob);
-        partEntry.layers.push({
-          file: `${folderName}/${fileName}`,
-          name: l.name,
-          x: Math.floor(l.x),
-          y: Math.floor(l.y),
-          w: canvas.width,
-          h: canvas.height,
-        });
+    for (let pi = 0; pi < pages.length; pi++) {
+      const pageDirName = `page-${String(pi + 1).padStart(2, '0')}`;
+      const pageDir = zip.folder(pageDirName);
+      const pageEntry = { name: pageDirName, parts: [] };
+
+      for (const { part, x, y } of pages[pi].layouts) {
+        const { groupName, layers } = buildPartLayers(part, x, y, scale);
+        const folderName = safeName(groupName);
+        const folder = pageDir.folder(folderName);
+        const partEntry = { name: groupName, folder: `${pageDirName}/${folderName}`, layers: [] };
+        for (let i = 0; i < layers.length; i++) {
+          const l = layers[i];
+          const canvas = renderLayerCanvas(l);
+          const blob = await new Promise((res) => canvas.toBlob(res, 'image/png'));
+          const fileName = `${String(i + 1).padStart(2, '0')}-${safeName(l.name)}.png`;
+          folder.file(fileName, blob);
+          partEntry.layers.push({
+            file: `${pageDirName}/${folderName}/${fileName}`,
+            name: l.name,
+            x: Math.floor(l.x),
+            y: Math.floor(l.y),
+            w: canvas.width,
+            h: canvas.height,
+          });
+        }
+        pageEntry.parts.push(partEntry);
       }
-      manifest.parts.push(partEntry);
+      manifest.pages.push(pageEntry);
     }
 
     zip.file('manifest.json', JSON.stringify(manifest, null, 2));
     const blob = await zip.generateAsync({ type: 'blob' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `papercraft-layers-${Date.now()}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, `papercraft-${pageSize}-layers-${Date.now()}.zip`);
   };
 
   // --- Concept image upload ---
@@ -1760,20 +1909,37 @@ Fill the entire image edge to edge with the surface texture. No tabs, fold lines
             </div>
           </div>
           <div style={styles.headerActions}>
+            <label style={styles.pageSelectWrap} title="Output page size — Letter or A4. Multi-page if parts don't fit.">
+              <span style={styles.pageSelectLabel}>Page</span>
+              <select
+                value={pageSize}
+                onChange={(e) => setPageSize(e.target.value)}
+                style={styles.pageSelect}
+              >
+                {Object.entries(PAGE_SIZES).map(([k, v]) => (
+                  <option key={k} value={k}>{v.label}</option>
+                ))}
+              </select>
+            </label>
             <button style={styles.iconBtn} onClick={() => setShowLabels(!showLabels)}>
               <Eye size={16} /> {showLabels ? 'Hide' : 'Show'} Labels
             </button>
-            <button style={styles.iconBtn} onClick={exportLayerZip} title="Each panel as its own transparent PNG, bundled with a manifest.json">
+            <button style={styles.iconBtn} onClick={exportLayerZip} disabled={!!exportError} title="Each panel as its own transparent PNG, bundled with a manifest.json">
               <FileArchive size={16} /> PNG Layers (.zip)
             </button>
-            <button style={styles.iconBtn} onClick={exportPSD} title="Layered PSD — one group per part, one layer per face">
+            <button style={styles.iconBtn} onClick={exportPSD} disabled={!!exportError} title="Layered PSD — one group per part, one layer per face">
               <Layers size={16} /> Export PSD
             </button>
-            <button style={styles.primaryBtn} onClick={exportPNG}>
+            <button style={styles.primaryBtn} onClick={exportPNG} disabled={!!exportError}>
               <Download size={16} /> Export PNG (300 DPI)
             </button>
           </div>
         </div>
+        {exportError && (
+          <div style={styles.exportErrorBar}>
+            <AlertCircle size={14} /> {exportError}
+          </div>
+        )}
       </header>
 
       <div style={styles.body}>
@@ -2231,7 +2397,43 @@ const styles = {
     color: colors.inkSoft,
     marginTop: -2,
   },
-  headerActions: { display: 'flex', gap: 10, alignItems: 'center' },
+  headerActions: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' },
+  pageSelectWrap: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 6,
+    border: `1.5px solid ${colors.border}`,
+    borderRadius: 4,
+    padding: '4px 8px 4px 10px',
+    background: 'rgba(255, 252, 240, 0.7)',
+  },
+  pageSelectLabel: {
+    fontFamily: "'Cinzel', serif",
+    fontSize: 11,
+    fontWeight: 700,
+    letterSpacing: '0.1em',
+    textTransform: 'uppercase',
+    color: colors.inkSoft,
+  },
+  pageSelect: {
+    border: 'none',
+    background: 'transparent',
+    fontFamily: "'Crimson Pro', serif",
+    fontSize: 13,
+    color: colors.ink,
+    outline: 'none',
+    cursor: 'pointer',
+  },
+  exportErrorBar: {
+    background: 'rgba(168, 66, 26, 0.12)',
+    borderTop: `1px solid rgba(168, 66, 26, 0.35)`,
+    color: colors.accentDark,
+    fontSize: 13,
+    padding: '8px 24px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+  },
   iconBtn: {
     display: 'inline-flex',
     alignItems: 'center',
@@ -2318,7 +2520,7 @@ const styles = {
   },
   partChipActive: {
     background: '#fff5d8',
-    borderColor: colors.accent,
+    border: `1.5px solid ${colors.accent}`,
     boxShadow: `inset 0 0 0 1px ${colors.accent}`,
   },
   partChipMain: {
